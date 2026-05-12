@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: obra-079
+    runtime: node
+    buildCommand: npm run build
+    startCommand: npm start
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: NODE_ENV
+        value: production
