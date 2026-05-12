@@ -12,15 +12,13 @@ function calcItem(item) {
   return { ...item, precio_total: parseFloat(precio_total.toFixed(4)), monto_iva, total };
 }
 
-function validarCantidadesRemitos(remitoIds, calcedItems) {
-  const placeholders = remitoIds.map(() => '?').join(',');
-
-  // Sumar cantidades de remito_items agrupado por articulo_id / descripcion
-  const rItems = db.prepare(
+async function validarCantidadesRemitos(remitoIds, calcedItems) {
+  const { rows: rItems } = await db.query(
     `SELECT articulo_id, descripcion, SUM(cantidad) as total_cant
-     FROM remito_items WHERE remito_id IN (${placeholders})
-     GROUP BY articulo_id, descripcion`
-  ).all(...remitoIds);
+     FROM remito_items WHERE remito_id = ANY($1::int[])
+     GROUP BY articulo_id, descripcion`,
+    [remitoIds]
+  );
 
   const factMap = {};
   for (const item of calcedItems) {
@@ -33,7 +31,7 @@ function validarCantidadesRemitos(remitoIds, calcedItems) {
   for (const item of rItems) {
     const key = item.articulo_id ? `id:${item.articulo_id}` : `desc:${item.descripcion}`;
     if (!remMap[key]) remMap[key] = { qty: 0, desc: item.descripcion };
-    remMap[key].qty += item.total_cant;
+    remMap[key].qty += parseFloat(item.total_cant);
   }
 
   const allKeys = new Set([...Object.keys(factMap), ...Object.keys(remMap)]);
@@ -49,192 +47,202 @@ function validarCantidadesRemitos(remitoIds, calcedItems) {
   return errores;
 }
 
-// GET all
-router.get('/', (req, res) => {
-  const { proveedor_id, obra_id, fecha_desde, fecha_hasta, moneda, condicion_pago, search } = req.query;
-  let sql = `
-    SELECT f.*, p.razon_social as proveedor_nombre, o.nombre as obra_nombre, o.numero as obra_numero
-    FROM facturas f
-    JOIN proveedores p ON p.id = f.proveedor_id
-    LEFT JOIN obras o ON o.id = f.obra_id
-    WHERE f.anulada = 0
-  `;
-  const params = [];
-  if (proveedor_id) { sql += ' AND f.proveedor_id = ?'; params.push(proveedor_id); }
-  if (obra_id) { sql += ' AND f.obra_id = ?'; params.push(obra_id); }
-  if (fecha_desde) { sql += ' AND f.fecha >= ?'; params.push(fecha_desde); }
-  if (fecha_hasta) { sql += ' AND f.fecha <= ?'; params.push(fecha_hasta); }
-  if (moneda) { sql += ' AND f.moneda = ?'; params.push(moneda); }
-  if (condicion_pago) { sql += ' AND f.condicion_pago = ?'; params.push(condicion_pago); }
-  if (search) { sql += ' AND (f.numero LIKE ? OR p.razon_social LIKE ?)'; params.push(`%${search}%`, `%${search}%`); }
-  sql += ' ORDER BY f.fecha DESC, f.id DESC';
-  res.json(db.prepare(sql).all(...params));
+router.get('/', async (req, res) => {
+  try {
+    const { proveedor_id, obra_id, fecha_desde, fecha_hasta, moneda, condicion_pago, search } = req.query;
+    const params = [];
+    let sql = `
+      SELECT f.*, p.razon_social as proveedor_nombre, o.nombre as obra_nombre, o.numero as obra_numero
+      FROM facturas f
+      JOIN proveedores p ON p.id = f.proveedor_id
+      LEFT JOIN obras o ON o.id = f.obra_id
+      WHERE f.anulada = 0`;
+    if (proveedor_id) { params.push(proveedor_id); sql += ` AND f.proveedor_id = $${params.length}`; }
+    if (obra_id) { params.push(obra_id); sql += ` AND f.obra_id = $${params.length}`; }
+    if (fecha_desde) { params.push(fecha_desde); sql += ` AND f.fecha >= $${params.length}`; }
+    if (fecha_hasta) { params.push(fecha_hasta); sql += ` AND f.fecha <= $${params.length}`; }
+    if (moneda) { params.push(moneda); sql += ` AND f.moneda = $${params.length}`; }
+    if (condicion_pago) { params.push(condicion_pago); sql += ` AND f.condicion_pago = $${params.length}`; }
+    if (search) {
+      params.push(`%${search}%`);
+      sql += ` AND (f.numero ILIKE $${params.length} OR p.razon_social ILIKE $${params.length})`;
+    }
+    sql += ' ORDER BY f.fecha DESC, f.id DESC';
+    const { rows } = await db.query(sql, params);
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-// GET one with items and remitos
-router.get('/:id', (req, res) => {
-  const f = db.prepare(`
-    SELECT f.*, p.razon_social as proveedor_nombre, o.nombre as obra_nombre
-    FROM facturas f
-    JOIN proveedores p ON p.id = f.proveedor_id
-    LEFT JOIN obras o ON o.id = f.obra_id
-    WHERE f.id = ?
-  `).get(req.params.id);
-  if (!f) return res.status(404).json({ error: 'Factura no encontrada' });
-  f.items = db.prepare('SELECT * FROM factura_items WHERE factura_id = ? ORDER BY id').all(req.params.id);
-  f.remitos = db.prepare(`
-    SELECT r.*, o.nombre as obra_nombre, o.numero as obra_numero
-    FROM remitos r
-    LEFT JOIN obras o ON o.id = r.obra_id
-    WHERE r.factura_id = ?
-  `).all(req.params.id);
-  res.json(f);
+router.get('/:id', async (req, res) => {
+  try {
+    const { rows } = await db.query(`
+      SELECT f.*, p.razon_social as proveedor_nombre, o.nombre as obra_nombre
+      FROM facturas f
+      JOIN proveedores p ON p.id = f.proveedor_id
+      LEFT JOIN obras o ON o.id = f.obra_id
+      WHERE f.id = $1
+    `, [req.params.id]);
+    if (!rows[0]) return res.status(404).json({ error: 'Factura no encontrada' });
+    const f = rows[0];
+    const { rows: items } = await db.query('SELECT * FROM factura_items WHERE factura_id = $1 ORDER BY id', [req.params.id]);
+    const { rows: remitos } = await db.query(`
+      SELECT r.*, o.nombre as obra_nombre, o.numero as obra_numero
+      FROM remitos r LEFT JOIN obras o ON o.id = r.obra_id
+      WHERE r.factura_id = $1
+    `, [req.params.id]);
+    f.items = items;
+    f.remitos = remitos;
+    res.json(f);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
-// POST create
-router.post('/', (req, res) => {
+router.post('/', async (req, res) => {
   const { proveedor_id, numero, fecha, moneda, obra_id, condicion_pago, medio_pago, items, remito_ids } = req.body;
   if (!proveedor_id || !numero || !fecha) return res.status(400).json({ error: 'Proveedor, número y fecha son requeridos' });
 
   let total_neto = 0, total_iva = 0, total = 0;
   const calcedItems = (items || []).map(item => {
     const c = calcItem(item);
-    total_neto += c.precio_total;
-    total_iva += c.monto_iva;
-    total += c.total;
+    total_neto += c.precio_total; total_iva += c.monto_iva; total += c.total;
     return c;
   });
 
   const remitoIds = Array.isArray(remito_ids) ? remito_ids.filter(Boolean).map(Number) : [];
 
   if (remitoIds.length > 0) {
-    const placeholders = remitoIds.map(() => '?').join(',');
-    const remitos = db.prepare(`SELECT id, estado FROM remitos WHERE id IN (${placeholders})`).all(...remitoIds);
+    const { rows: remitos } = await db.query('SELECT id, estado FROM remitos WHERE id = ANY($1::int[])', [remitoIds]);
     const yaFacturados = remitos.filter(r => r.estado === 'facturado');
     if (yaFacturados.length > 0) {
       return res.status(400).json({ error: `Los remitos ${yaFacturados.map(r => r.id).join(', ')} ya están facturados` });
     }
-
-    const errores = validarCantidadesRemitos(remitoIds, calcedItems);
+    const errores = await validarCantidadesRemitos(remitoIds, calcedItems);
     if (errores.length > 0) {
       return res.status(400).json({ error: `Las cantidades no coinciden — ${errores.join(' | ')}` });
     }
   }
 
-  const insertFactura = db.prepare(`
-    INSERT INTO facturas (proveedor_id, numero, fecha, moneda, obra_id, condicion_pago, medio_pago, total_neto, total_iva, total)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  const insertItem = db.prepare(`
-    INSERT INTO factura_items (factura_id, articulo_id, codigo, descripcion, unidad, cantidad, precio_unitario, precio_total, tipo_iva, monto_iva, total)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-
-  const run = db.transaction(() => {
-    const r = insertFactura.run(
-      proveedor_id, numero, fecha, moneda || 'UYU',
-      obra_id || null, condicion_pago || 'credito', medio_pago || null,
-      parseFloat(total_neto.toFixed(4)), parseFloat(total_iva.toFixed(4)), parseFloat(total.toFixed(4))
+  const client = await db.getClient();
+  try {
+    await client.query('BEGIN');
+    const { rows: fRows } = await client.query(
+      `INSERT INTO facturas (proveedor_id, numero, fecha, moneda, obra_id, condicion_pago, medio_pago, total_neto, total_iva, total)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
+      [proveedor_id, numero, fecha, moneda || 'UYU', obra_id || null, condicion_pago || 'credito',
+       medio_pago || null, parseFloat(total_neto.toFixed(4)), parseFloat(total_iva.toFixed(4)), parseFloat(total.toFixed(4))]
     );
-    const factura_id = r.lastInsertRowid;
+    const factura_id = fRows[0].id;
     for (const item of calcedItems) {
-      insertItem.run(
-        factura_id, item.articulo_id || null, item.codigo || '', item.descripcion,
-        item.unidad || '', item.cantidad, item.precio_unitario,
-        item.precio_total, item.tipo_iva || 'TB', item.monto_iva, item.total
+      await client.query(
+        `INSERT INTO factura_items (factura_id, articulo_id, codigo, descripcion, unidad, cantidad, precio_unitario, precio_total, tipo_iva, monto_iva, total)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        [factura_id, item.articulo_id || null, item.codigo || '', item.descripcion,
+         item.unidad || '', item.cantidad, item.precio_unitario,
+         item.precio_total, item.tipo_iva || 'TB', item.monto_iva, item.total]
       );
     }
     if (remitoIds.length > 0) {
-      const linkRemito = db.prepare(`UPDATE remitos SET factura_id=?, estado='facturado', updated_at=datetime('now','localtime') WHERE id=?`);
-      for (const rid of remitoIds) linkRemito.run(factura_id, rid);
+      await client.query(
+        `UPDATE remitos SET factura_id=$1, estado='facturado', updated_at=NOW() WHERE id = ANY($2::int[])`,
+        [factura_id, remitoIds]
+      );
     }
-    return factura_id;
-  });
-
-  try {
-    const id = run();
-    res.json({ id });
+    await client.query('COMMIT');
+    res.json({ id: factura_id });
   } catch (e) {
+    await client.query('ROLLBACK');
     res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
   }
 });
 
-// PUT update
-router.put('/:id', (req, res) => {
+router.put('/:id', async (req, res) => {
   const { proveedor_id, numero, fecha, moneda, obra_id, condicion_pago, medio_pago, items, remito_ids } = req.body;
 
   let total_neto = 0, total_iva = 0, total = 0;
   const calcedItems = (items || []).map(item => {
     const c = calcItem(item);
-    total_neto += c.precio_total;
-    total_iva += c.monto_iva;
-    total += c.total;
+    total_neto += c.precio_total; total_iva += c.monto_iva; total += c.total;
     return c;
   });
 
   const remitoIds = Array.isArray(remito_ids) ? remito_ids.filter(Boolean).map(Number) : [];
 
   if (remitoIds.length > 0) {
-    const placeholders = remitoIds.map(() => '?').join(',');
-    const remitos = db.prepare(`SELECT id, estado, factura_id FROM remitos WHERE id IN (${placeholders})`).all(...remitoIds);
-    const yaFacturadosOtro = remitos.filter(r => r.estado === 'facturado' && r.factura_id !== parseInt(req.params.id));
+    const { rows: remitos } = await db.query(
+      'SELECT id, estado, factura_id FROM remitos WHERE id = ANY($1::int[])', [remitoIds]
+    );
+    const yaFacturadosOtro = remitos.filter(r => r.estado === 'facturado' && parseInt(r.factura_id) !== parseInt(req.params.id));
     if (yaFacturadosOtro.length > 0) {
       return res.status(400).json({ error: `Los remitos ${yaFacturadosOtro.map(r => r.id).join(', ')} ya están vinculados a otra factura` });
     }
-
-    const errores = validarCantidadesRemitos(remitoIds, calcedItems);
+    const errores = await validarCantidadesRemitos(remitoIds, calcedItems);
     if (errores.length > 0) {
       return res.status(400).json({ error: `Las cantidades no coinciden — ${errores.join(' | ')}` });
     }
   }
 
-  const run = db.transaction(() => {
-    db.prepare(`
-      UPDATE facturas SET proveedor_id=?, numero=?, fecha=?, moneda=?, obra_id=?, condicion_pago=?, medio_pago=?,
-      total_neto=?, total_iva=?, total=?, updated_at=datetime('now','localtime') WHERE id=?
-    `).run(
-      proveedor_id, numero, fecha, moneda || 'UYU', obra_id || null,
-      condicion_pago || 'credito', medio_pago || null,
-      parseFloat(total_neto.toFixed(4)), parseFloat(total_iva.toFixed(4)), parseFloat(total.toFixed(4)),
-      req.params.id
+  const client = await db.getClient();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `UPDATE facturas SET proveedor_id=$1, numero=$2, fecha=$3, moneda=$4, obra_id=$5,
+       condicion_pago=$6, medio_pago=$7, total_neto=$8, total_iva=$9, total=$10, updated_at=NOW() WHERE id=$11`,
+      [proveedor_id, numero, fecha, moneda || 'UYU', obra_id || null,
+       condicion_pago || 'credito', medio_pago || null,
+       parseFloat(total_neto.toFixed(4)), parseFloat(total_iva.toFixed(4)), parseFloat(total.toFixed(4)),
+       req.params.id]
     );
-    db.prepare('DELETE FROM factura_items WHERE factura_id = ?').run(req.params.id);
-    const insertItem = db.prepare(`
-      INSERT INTO factura_items (factura_id, articulo_id, codigo, descripcion, unidad, cantidad, precio_unitario, precio_total, tipo_iva, monto_iva, total)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
+    await client.query('DELETE FROM factura_items WHERE factura_id = $1', [req.params.id]);
     for (const item of calcedItems) {
-      insertItem.run(
-        req.params.id, item.articulo_id || null, item.codigo || '', item.descripcion,
-        item.unidad || '', item.cantidad, item.precio_unitario,
-        item.precio_total, item.tipo_iva || 'TB', item.monto_iva, item.total
+      await client.query(
+        `INSERT INTO factura_items (factura_id, articulo_id, codigo, descripcion, unidad, cantidad, precio_unitario, precio_total, tipo_iva, monto_iva, total)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        [req.params.id, item.articulo_id || null, item.codigo || '', item.descripcion,
+         item.unidad || '', item.cantidad, item.precio_unitario,
+         item.precio_total, item.tipo_iva || 'TB', item.monto_iva, item.total]
       );
     }
-    db.prepare(`UPDATE remitos SET factura_id=NULL, estado='pendiente', updated_at=datetime('now','localtime') WHERE factura_id=?`).run(req.params.id);
+    await client.query(
+      `UPDATE remitos SET factura_id=NULL, estado='pendiente', updated_at=NOW() WHERE factura_id=$1`,
+      [req.params.id]
+    );
     if (remitoIds.length > 0) {
-      const linkRemito = db.prepare(`UPDATE remitos SET factura_id=?, estado='facturado', updated_at=datetime('now','localtime') WHERE id=?`);
-      for (const rid of remitoIds) linkRemito.run(req.params.id, rid);
+      await client.query(
+        `UPDATE remitos SET factura_id=$1, estado='facturado', updated_at=NOW() WHERE id = ANY($2::int[])`,
+        [req.params.id, remitoIds]
+      );
     }
-  });
-
-  try {
-    run();
+    await client.query('COMMIT');
     res.json({ id: req.params.id });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
+router.delete('/:id', async (req, res) => {
+  try {
+    await db.query('UPDATE facturas SET anulada=1, updated_at=NOW() WHERE id=$1', [req.params.id]);
+    res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// DELETE (anular)
-router.delete('/:id', (req, res) => {
-  db.prepare(`UPDATE facturas SET anulada=1, updated_at=datetime('now','localtime') WHERE id=?`).run(req.params.id);
-  res.json({ ok: true });
-});
-
-// GET items of a factura (for NC)
-router.get('/:id/items', (req, res) => {
-  const items = db.prepare('SELECT * FROM factura_items WHERE factura_id = ? ORDER BY id').all(req.params.id);
-  res.json(items);
+router.get('/:id/items', async (req, res) => {
+  try {
+    const { rows } = await db.query('SELECT * FROM factura_items WHERE factura_id = $1 ORDER BY id', [req.params.id]);
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 module.exports = router;

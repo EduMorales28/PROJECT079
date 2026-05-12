@@ -15,13 +15,11 @@ function parseDate(val) {
     return d.toISOString().slice(0, 10);
   }
   if (typeof val === 'number') {
-    // Excel serial date
     const d = new Date((val - 25569) * 86400 * 1000);
     return d.toISOString().slice(0, 10);
   }
   const s = String(val).trim();
   if (!s) return null;
-  // DD/MM/YYYY
   const m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
   if (m) return `${m[3]}-${m[2].padStart(2,'0')}-${m[1].padStart(2,'0')}`;
   if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
@@ -48,8 +46,7 @@ function parseNum(val) {
   return parseFloat(String(val).replace(',', '.')) || 0;
 }
 
-// POST /api/importar/datos
-router.post('/datos', upload.single('file'), (req, res) => {
+router.post('/datos', upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No se recibió archivo' });
 
   try {
@@ -61,7 +58,6 @@ router.post('/datos', upload.single('file'), (req, res) => {
     if (rows.length < 2) return res.status(400).json({ error: 'El Excel está vacío' });
 
     const headers = rows[0].map(h => String(h).toLowerCase().trim());
-
     const col = {
       proveedor: headers.findIndex(h => h.includes('proveedor') || h.includes('razon') || h.includes('razón') || h.includes('social')),
       fecha:    headers.findIndex(h => h.includes('fecha')),
@@ -78,41 +74,22 @@ router.post('/datos', upload.single('file'), (req, res) => {
       return res.status(400).json({ error: `Columnas no encontradas: ${missing.join(', ')}. Encabezados detectados: ${headers.join(', ')}` });
     }
 
-    // Cache de proveedores para no ir a la BD en cada fila
     const proveedorCache = {};
-    const getProveedorId = (nombre) => {
+    const getProveedorId = async (nombre) => {
       const key = String(nombre || '').trim().toLowerCase();
       if (!key) return null;
       if (proveedorCache[key] !== undefined) return proveedorCache[key];
-      const p = db.prepare("SELECT id FROM proveedores WHERE LOWER(TRIM(razon_social)) = ?").get(key);
-      proveedorCache[key] = p ? p.id : null;
+      const { rows } = await db.query("SELECT id FROM proveedores WHERE LOWER(TRIM(razon_social)) = $1", [key]);
+      proveedorCache[key] = rows[0] ? rows[0].id : null;
       return proveedorCache[key];
     };
 
-    const stmts = {
-      insertFact: db.prepare(`
-        INSERT INTO facturas (proveedor_id, numero, fecha, moneda, obra_id, condicion_pago, total_neto, total_iva, total)
-        VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?)
-      `),
-      insertFactItem: db.prepare(`
-        INSERT INTO factura_items (factura_id, articulo_id, codigo, descripcion, unidad, cantidad, precio_unitario, precio_total, tipo_iva, monto_iva, total)
-        VALUES (?, NULL, '', 'Importado de planilla', '', 1, ?, ?, ?, ?, ?)
-      `),
-      insertNC: db.prepare(`
-        INSERT INTO notas_credito (proveedor_id, factura_id, numero, fecha, moneda, total_neto, total_iva, total)
-        VALUES (?, NULL, ?, ?, ?, ?, ?, ?)
-      `),
-      insertNCItem: db.prepare(`
-        INSERT INTO nota_credito_items (nota_credito_id, factura_item_id, articulo_id, codigo, descripcion, unidad, cantidad, precio_unitario, precio_total, tipo_iva, monto_iva, total)
-        VALUES (?, NULL, NULL, '', 'Importado de planilla', '', 1, ?, ?, ?, ?, ?)
-      `),
-      checkFact: db.prepare('SELECT id FROM facturas WHERE proveedor_id=? AND numero=?'),
-      checkNC:   db.prepare('SELECT id FROM notas_credito WHERE proveedor_id=? AND numero=?'),
-    };
-
     const results = { facturas: 0, ncs: 0, omitidos: 0, errores: [] };
+    const dataRows = rows.slice(1).filter(r => r.some(c => c !== ''));
 
-    const importAll = db.transaction((dataRows) => {
+    const client = await db.getClient();
+    try {
+      await client.query('BEGIN');
       for (let i = 0; i < dataRows.length; i++) {
         const row = dataRows[i];
         const proveedorNombre = String(row[col.proveedor] || '').trim();
@@ -126,7 +103,7 @@ router.post('/datos', upload.single('file'), (req, res) => {
 
         if (!fecha || !numero || !tipoRaw) { results.omitidos++; continue; }
 
-        const proveedor_id = getProveedorId(proveedorNombre);
+        const proveedor_id = await getProveedorId(proveedorNombre);
         if (!proveedor_id) {
           results.errores.push(`Fila ${i + 2}: proveedor no encontrado "${proveedorNombre}"`);
           continue;
@@ -135,27 +112,59 @@ router.post('/datos', upload.single('file'), (req, res) => {
         const tipo_iva = getTipoIva(subtotal, monto_iva);
 
         if (tipoRaw === 'faccre' || tipoRaw === 'faccre+') {
-          if (stmts.checkFact.get(proveedor_id, numero)) { results.omitidos++; continue; }
-          const r = stmts.insertFact.run(proveedor_id, numero, fecha, moneda, 'credito', subtotal, monto_iva, total);
-          stmts.insertFactItem.run(r.lastInsertRowid, subtotal, subtotal, tipo_iva, monto_iva, total);
+          const { rows: ex } = await client.query('SELECT id FROM facturas WHERE proveedor_id=$1 AND numero=$2', [proveedor_id, numero]);
+          if (ex.length) { results.omitidos++; continue; }
+          const { rows: fr } = await client.query(
+            `INSERT INTO facturas (proveedor_id, numero, fecha, moneda, obra_id, condicion_pago, total_neto, total_iva, total)
+             VALUES ($1, $2, $3, $4, NULL, 'credito', $5, $6, $7) RETURNING id`,
+            [proveedor_id, numero, fecha, moneda, subtotal, monto_iva, total]
+          );
+          await client.query(
+            `INSERT INTO factura_items (factura_id, articulo_id, codigo, descripcion, unidad, cantidad, precio_unitario, precio_total, tipo_iva, monto_iva, total)
+             VALUES ($1, NULL, '', 'Importado de planilla', '', 1, $2, $2, $3, $4, $5)`,
+            [fr[0].id, subtotal, tipo_iva, monto_iva, total]
+          );
           results.facturas++;
         } else if (tipoRaw === 'faccdo') {
-          if (stmts.checkFact.get(proveedor_id, numero)) { results.omitidos++; continue; }
-          const r = stmts.insertFact.run(proveedor_id, numero, fecha, moneda, 'contado', subtotal, monto_iva, total);
-          stmts.insertFactItem.run(r.lastInsertRowid, subtotal, subtotal, tipo_iva, monto_iva, total);
+          const { rows: ex } = await client.query('SELECT id FROM facturas WHERE proveedor_id=$1 AND numero=$2', [proveedor_id, numero]);
+          if (ex.length) { results.omitidos++; continue; }
+          const { rows: fr } = await client.query(
+            `INSERT INTO facturas (proveedor_id, numero, fecha, moneda, obra_id, condicion_pago, total_neto, total_iva, total)
+             VALUES ($1, $2, $3, $4, NULL, 'contado', $5, $6, $7) RETURNING id`,
+            [proveedor_id, numero, fecha, moneda, subtotal, monto_iva, total]
+          );
+          await client.query(
+            `INSERT INTO factura_items (factura_id, articulo_id, codigo, descripcion, unidad, cantidad, precio_unitario, precio_total, tipo_iva, monto_iva, total)
+             VALUES ($1, NULL, '', 'Importado de planilla', '', 1, $2, $2, $3, $4, $5)`,
+            [fr[0].id, subtotal, tipo_iva, monto_iva, total]
+          );
           results.facturas++;
         } else if (tipoRaw === 'nc' || tipoRaw === 'nc+') {
-          if (stmts.checkNC.get(proveedor_id, numero)) { results.omitidos++; continue; }
-          const r = stmts.insertNC.run(proveedor_id, numero, fecha, moneda, subtotal, monto_iva, total);
-          stmts.insertNCItem.run(r.lastInsertRowid, subtotal, subtotal, tipo_iva, monto_iva, total);
+          const { rows: ex } = await client.query('SELECT id FROM notas_credito WHERE proveedor_id=$1 AND numero=$2', [proveedor_id, numero]);
+          if (ex.length) { results.omitidos++; continue; }
+          const { rows: nr } = await client.query(
+            `INSERT INTO notas_credito (proveedor_id, factura_id, numero, fecha, moneda, total_neto, total_iva, total)
+             VALUES ($1, NULL, $2, $3, $4, $5, $6, $7) RETURNING id`,
+            [proveedor_id, numero, fecha, moneda, subtotal, monto_iva, total]
+          );
+          await client.query(
+            `INSERT INTO nota_credito_items (nota_credito_id, factura_item_id, articulo_id, codigo, descripcion, unidad, cantidad, precio_unitario, precio_total, tipo_iva, monto_iva, total)
+             VALUES ($1, NULL, NULL, '', 'Importado de planilla', '', 1, $2, $2, $3, $4, $5)`,
+            [nr[0].id, subtotal, tipo_iva, monto_iva, total]
+          );
           results.ncs++;
         } else {
           results.errores.push(`Fila ${i + 2}: tipo desconocido "${row[col.tipo]}"`);
         }
       }
-    });
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
 
-    importAll(rows.slice(1).filter(r => r.some(c => c !== '')));
     res.json(results);
   } catch (e) {
     if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
